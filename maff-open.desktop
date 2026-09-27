@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Open MAFF Archive
+GenericName=MAFF Viewer
+Comment=Extract a Mozilla Archive Format page and open it in the default browser
+Exec=maff-open %F
+MimeType=application/x-maff;
+Icon=text-html
+Terminal=false
+Categories=Office;Viewer;
+Keywords=maff;mozilla;archive;webpage;
+StartupNotify=false

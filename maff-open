@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 M. Scott Reynolds
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Open a Mozilla Archive Format (.maff) page in the default browser.
+
+A .maff file is a ZIP archive with one folder per saved page. This extracts
+that page into the user cache and opens its index file. The copy stays in
+the cache so the browser can keep loading images and stylesheets after this
+program exits. The same archive is extracted again only when its size or
+modification time changes.
+
+    maff-open ARCHIVE.maff [ARCHIVE.maff ...]
+    maff-open --list ARCHIVE.maff
+    maff-open --clear
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path
+
+RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+INDEX_NAMES = ("index.html", "index.htm", "index.xhtml", "index.xht")
+RDF_FIELDS = ("originalurl", "title", "archivetime", "indexfilename", "charset")
+
+
+class MaffError(Exception):
+    """The archive cannot be opened as a MAFF page."""
+
+
+def cache_root() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    root = Path(base) / "maff-open"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def fail(message: str) -> None:
+    message = message.strip() or "Could not open the archive."
+    if sys.stderr.isatty():
+        print(message, file=sys.stderr)
+    elif shutil.which("zenity"):
+        subprocess.run(
+            ["zenity", "--error", "--title=Open MAFF Archive", "--text", message],
+            check=False,
+        )
+    raise SystemExit(1)
+
+
+def local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def safe_relative(name: str) -> Path:
+    """Return a relative path, rejecting absolute paths and '..' parts."""
+    name = name.replace("\\", "/").lstrip("/")
+    parts = [part for part in name.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        raise MaffError(f"Archive contains an unsafe path: {name}")
+    return Path(*parts) if parts else Path()
+
+
+def read_rdf(data: bytes) -> dict[str, str]:
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        raise MaffError(f"index.rdf is not valid XML ({exc}).") from exc
+    meta: dict[str, str] = {}
+    resource_attr = f"{{{RDF_NS}}}resource"
+    for element in root.iter():
+        key = local_name(element.tag)
+        if key not in RDF_FIELDS or key in meta:
+            continue
+        value = element.attrib.get(resource_attr) or "".join(element.itertext()).strip()
+        if value:
+            meta[key] = value
+    return meta
+
+
+def open_zip(archive: Path) -> zipfile.ZipFile:
+    try:
+        return zipfile.ZipFile(archive)
+    except zipfile.BadZipFile as exc:
+        raise MaffError(f"{archive.name} is not a MAFF archive (the file is not a zip).") from exc
+    except OSError as exc:
+        raise MaffError(f"{archive}: {exc}") from exc
+
+
+def page_folders(zf: zipfile.ZipFile) -> list[str]:
+    folders: list[str] = []
+    seen: set[str] = set()
+    for info in zf.infolist():
+        relative = safe_relative(info.filename)
+        if len(relative.parts) < 2:
+            continue
+        folder = relative.parts[0]
+        if folder not in seen:
+            seen.add(folder)
+            folders.append(folder)
+    return folders
+
+
+def page_metadata(zf: zipfile.ZipFile) -> list[dict[str, str]]:
+    pages: list[dict[str, str]] = []
+    for folder in page_folders(zf):
+        meta: dict[str, str] = {"folder": folder}
+        rdf_name = f"{folder}/index.rdf"
+        try:
+            meta.update(read_rdf(zf.read(rdf_name)))
+        except KeyError:
+            pass
+        pages.append(meta)
+    if not pages:
+        raise MaffError("No saved page was found inside the archive.")
+    return pages
+
+
+def discover_index(directory: Path, requested: str | None) -> str:
+    if requested:
+        relative = safe_relative(requested)
+        if len(relative.parts) != 1:
+            raise MaffError(f"The archive names a main document outside the page folder: {requested}")
+        if (directory / relative).is_file():
+            return relative.name
+    for name in INDEX_NAMES:
+        if (directory / name).is_file():
+            return name
+    raise MaffError("The saved page has no index.html.")
+
+
+def extract_page(zf: zipfile.ZipFile, folder: str, dest: Path) -> None:
+    prefix = folder + "/"
+    wrote = False
+    for info in zf.infolist():
+        raw = info.filename.replace("\\", "/")
+        if not raw.startswith(prefix):
+            continue
+        relative = safe_relative(raw[len(prefix):])
+        target = dest.joinpath(*relative.parts) if relative.parts else dest
+        if info.is_dir() or raw.endswith("/"):
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with zf.open(info, "r") as source, open(target, "wb") as output:
+                shutil.copyfileobj(source, output)
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "password" in message or "encrypted" in message:
+                raise MaffError("This archive is encrypted.") from exc
+            raise
+        wrote = True
+    if not wrote:
+        raise MaffError(f"The page folder {folder} is empty.")
+
+
+def extract_archive(archive: Path, dest: Path) -> dict:
+    with open_zip(archive) as zf:
+        pages = page_metadata(zf)
+        multiple = len(pages) > 1
+        for page in pages:
+            page_dest = dest / page["folder"] if multiple else dest
+            extract_page(zf, page["folder"], page_dest)
+            index = discover_index(page_dest, page.get("indexfilename"))
+            page["index"] = index
+            page["open"] = str((page_dest / index).relative_to(dest))
+    return {"pages": pages}
+
+
+def prepare(archive: Path) -> tuple[Path, dict]:
+    archive = archive.expanduser().resolve()
+    if not archive.is_file():
+        raise MaffError(f"Not a file: {archive}")
+    stat = archive.stat()
+    identity = f"{archive}|{stat.st_size}|{stat.st_mtime_ns}"
+    key = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    final = cache_root() / key
+    stamp_path = final / ".maff-open.json"
+    if stamp_path.is_file():
+        try:
+            saved = json.loads(stamp_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            saved = None
+        if saved and saved.get("size") == stat.st_size and saved.get("mtime_ns") == stat.st_mtime_ns:
+            return final, saved
+        shutil.rmtree(final, ignore_errors=True)
+
+    temporary = Path(tempfile.mkdtemp(prefix=f".{key}-", dir=cache_root()))
+    try:
+        meta = extract_archive(archive, temporary)
+        meta["source"] = str(archive)
+        meta["size"] = stat.st_size
+        meta["mtime_ns"] = stat.st_mtime_ns
+        (temporary / ".maff-open.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+        temporary.rename(final)
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return final, meta
+
+
+def describe(page: dict[str, str], location: Path | None) -> None:
+    print(page.get("title") or "Untitled page")
+    if page.get("archivetime"):
+        print(f"  saved {page['archivetime']}")
+    if page.get("originalurl"):
+        print(f"  from  {page['originalurl']}")
+    if location is not None:
+        print(f"  file  {location}")
+
+
+def inspect_archive(archive: Path) -> list[dict[str, str]]:
+    archive = archive.expanduser().resolve()
+    if not archive.is_file():
+        raise MaffError(f"Not a file: {archive}")
+    with open_zip(archive) as zf:
+        return page_metadata(zf)
+
+
+def open_in_browser(path: Path) -> None:
+    if shutil.which("xdg-open") is None:
+        raise MaffError("xdg-open is not available, so the default browser cannot be launched.")
+    result = subprocess.run(["xdg-open", str(path)], capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise MaffError(detail or f"The browser did not open {path}.")
+
+
+def pick_files() -> list[Path]:
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        raise MaffError("Give the path of a .maff file.\nUsage: maff-open ARCHIVE.maff")
+    if shutil.which("zenity") is None:
+        raise MaffError("Give the path of a .maff file.\nUsage: maff-open ARCHIVE.maff")
+    result = subprocess.run(
+        [
+            "zenity",
+            "--file-selection",
+            "--multiple",
+            "--separator=\n",
+            "--title=Open MAFF archive",
+            f"--filename={Path.cwd()}/",
+            "--file-filter=Mozilla archives (*.maff) | *.maff *.MAFF",
+            "--file-filter=All files | *",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+    return [Path(line) for line in result.stdout.splitlines() if line]
+
+
+def clear_cache() -> None:
+    root = cache_root()
+    removed = 0
+    for child in list(root.iterdir()):
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+        removed += 1
+    print(f"Removed {removed} cached {'entry' if removed == 1 else 'entries'} from {root}")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Open a Mozilla Archive Format (.maff) page in the default browser.",
+        epilog="Extracted pages are kept in ~/.cache/maff-open (or $XDG_CACHE_HOME/maff-open). "
+        "maff-open --clear deletes them.",
+    )
+    parser.add_argument("archives", nargs="*", type=Path, help="MAFF files to open")
+    parser.add_argument("--list", action="store_true", help="show the saved title, date, and original URL, then exit")
+    parser.add_argument("--clear", action="store_true", help="delete extracted copies from the cache and exit")
+    args = parser.parse_args(argv)
+
+    if args.clear:
+        clear_cache()
+        return
+
+    archives = list(args.archives)
+    if not archives:
+        try:
+            archives = pick_files()
+        except MaffError as exc:
+            fail(str(exc))
+        if not archives:
+            return
+
+    errors: list[str] = []
+    for archive in archives:
+        try:
+            if args.list:
+                for page in inspect_archive(archive):
+                    describe(page, archive.expanduser().resolve())
+            else:
+                dest, meta = prepare(archive)
+                for page in meta["pages"]:
+                    target = dest / page["open"]
+                    describe(page, target)
+                    open_in_browser(target)
+        except MaffError as exc:
+            errors.append(f"{archive}: {exc}")
+        if archive != archives[-1]:
+            print()
+    if errors:
+        fail("\n".join(errors))
+
+if __name__ == "__main__":
+    main()
+
+
+# msr/gk
