@@ -145,10 +145,11 @@ def page_metadata(zf: zipfile.ZipFile) -> list[dict[str, str]]:
 def discover_index(directory: Path, requested: str | None) -> str:
     if requested:
         relative = safe_relative(requested)
-        if len(relative.parts) != 1:
-            raise MaffError(f"The archive names a main document outside the page folder: {requested}")
+        if not relative.parts:
+            raise MaffError(f"The archive names an empty main document: {requested}")
         if (directory / relative).is_file():
-            return relative.name
+            return relative.as_posix()
+        raise MaffError(f"The archive names a missing main document: {requested}")
     for name in INDEX_NAMES:
         if (directory / name).is_file():
             return name

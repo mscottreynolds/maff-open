@@ -106,7 +106,7 @@ These are optional:
 Clone or copy this directory, then install the script onto your `PATH`:
 
 ```bash
-install -Dm755 maff-open "${HOME}/.local/bin/maff-open"
+install -Dm755 maff-open maff-create "${HOME}/.local/bin/"
 ```
 
 Confirm it runs:
@@ -119,7 +119,7 @@ To open `.maff` files from the file manager, install the desktop entry and the M
 
 ```bash
 bindir="${HOME}/.local/bin"
-install -Dm755 maff-open "${bindir}/maff-open"
+install -Dm755 maff-open maff-create "${bindir}/"
 sed "s|^Exec=.*|Exec=${bindir}/maff-open %F|" maff-open.desktop \
   > "${HOME}/.local/share/applications/maff-open.desktop"
 install -Dm644 application-x-maff.xml \
@@ -165,6 +165,27 @@ maff-open --clear
 
 From a terminal, errors are printed to standard error. From the file manager, where there is no terminal, the same message is shown with `zenity` when `zenity` is installed.
 
+## Creating an archive
+
+`maff-create` packs a page you already have on disk into a `.maff` file that `maff-open` can open.
+
+```bash
+maff-create ~/Projects/tmodc.com/index.html
+maff-create "My Page.html" -o "My Page.maff"
+maff-create --url https://example.com/page "My Page.html"
+```
+
+The file you name decides what is packed.
+
+- A directory saved with `wget -m -k` is packed from the directory that contains that file. Naming `index.html` archives the whole mirror, including pages linked from it, so those links still work. Naming a page in a subdirectory, such as `docs/changelog.html`, does the same and records that page as the one to open.
+- A "Webpage, Complete" save is packed as the HTML file plus its `_files` folder. Other files sitting in the same directory are left out. The HTML file is stored as `index.html`, and links to its old name are updated. A `<base href>` that points at the original site is cleared so those relative links stay inside the archive.
+
+`--url` and `--title` fill in `index.rdf` when the save does not record them. The date stored there is the HTML file's modification time. Several HTML files become several pages in one archive:
+
+```bash
+maff-create first.html second.html -o pages.maff
+```
+
 ## How opening works
 
 1. The archive is opened as a ZIP file.
@@ -204,6 +225,7 @@ Calibre has no MAFF reader in its own viewer. On the machine where this program 
 ```bash
 maff-open --clear
 rm -f "${HOME}/.local/bin/maff-open" \
+      "${HOME}/.local/bin/maff-create" \
       "${HOME}/.local/share/applications/maff-open.desktop" \
       "${HOME}/.local/share/mime/packages/application-x-maff.xml"
 update-mime-database "${HOME}/.local/share/mime"
@@ -219,7 +241,7 @@ Remove the `application/x-maff` line from `~/.config/mimeapps.list` if it is sti
 | Scott Reynolds | Direction, review, and testing |
 | [Grok 4.7](https://x.ai/) (xAI) | Implementation and documentation |
 
-September 2026. Written by Grok at Scott Reynolds's direction. Reviewed and accepted by Scott Reynolds.
+September 2026. Written by Grok at Scott Reynolds's direction. Reviewed and accepted by Scott Reynolds. `maff-create` was added the same way.
 
 ## License
 

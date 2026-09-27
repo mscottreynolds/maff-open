@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 M. Scott Reynolds
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Pack a saved web page or a wget mirror into a MAFF archive.
+
+    maff-create PAGE.html [-o ARCHIVE.maff]
+    maff-create --url https://example.com/page PAGE.html
+
+A "Webpage, Complete" save is the HTML file plus its sibling _files folder.
+A directory saved with wget -m -k is packed from the directory that contains
+the page you name, so links between its pages stay intact. maff-open can
+open the result.
+"""
+
+from __future__ import annotations
+
+import argparse
+import email.utils
+import os
+import random
+import re
+import sys
+import time
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path
+from urllib.parse import unquote
+from xml.sax.saxutils import escape
+
+RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+MAF_NS = "http://maf.mozdev.org/metadata/rdf#"
+NC_NS = "http://home.netscape.com/NC-rdf#"
+
+INDEX_FOR_SUFFIX = {
+    ".html": "index.html",
+    ".htm": "index.htm",
+    ".xhtml": "index.xhtml",
+    ".xht": "index.xht",
+}
+TEXT_SUFFIXES = {".html", ".htm", ".xhtml", ".xht", ".css", ".svg", ".xml", ".js"}
+STORED_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico",
+    ".mp3", ".mp4", ".webm", ".ogg", ".opus", ".woff", ".woff2",
+    ".gz", ".tgz", ".zip", ".maff", ".pdf", ".wasm", ".br",
+}
+
+ATTR_URL = re.compile(
+    r"""(?P<prefix>\b(?:href|src|poster)\s*=\s*)(?P<q>["'])(?P<url>.*?)(?P=q)""",
+    re.IGNORECASE,
+)
+SRCSET = re.compile(r"""(?P<prefix>\bsrcset\s*=\s*)(?P<q>["'])(?P<val>.*?)(?P=q)""", re.IGNORECASE)
+CSS_URL = re.compile(r"""(?P<prefix>url\(\s*)(?P<q>["']?)(?P<url>[^"')]+)(?P=q)(?P<suffix>\s*\))""", re.IGNORECASE)
+BASE_HREF = re.compile(
+    r"""(?P<prefix><base\b[^>]*\bhref\s*=\s*)(?P<q>["'])(?P<url>.*?)(?P=q)""",
+    re.IGNORECASE,
+)
+TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+CHARSET = re.compile(r"""charset\s*=\s*["']?\s*([A-Za-z0-9._-]+)""", re.IGNORECASE)
+SAVED_FROM = re.compile(r"saved from url=\(\d+\)(\S+)", re.IGNORECASE)
+CANONICAL = re.compile(
+    r"""<link\b[^>]*\brel\s*=\s*["']canonical["'][^>]*>""",
+    re.IGNORECASE,
+)
+HREF_VALUE = re.compile(r"""\bhref\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+
+
+class CreateError(Exception):
+    """The page cannot be packed as a MAFF archive."""
+
+
+def fail(message: str) -> None:
+    print(message.strip() or "Could not create the archive.", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def detect_charset(raw: bytes) -> str:
+    match = CHARSET.search(raw[:8192].decode("ascii", errors="ignore"))
+    return match.group(1) if match else "utf-8"
+
+
+def read_text(path: Path) -> tuple[str, str]:
+    raw = path.read_bytes()
+    charset = detect_charset(raw)
+    try:
+        return raw.decode(charset), charset
+    except (LookupError, UnicodeDecodeError):
+        return raw.decode("utf-8", errors="replace"), "utf-8"
+
+
+def html_title(text: str) -> str | None:
+    match = TITLE.search(text)
+    if not match:
+        return None
+    title = re.sub(r"\s+", " ", match.group(1)).strip()
+    return title or None
+
+
+def discovered_url(text: str) -> str | None:
+    saved = SAVED_FROM.search(text)
+    if saved:
+        return saved.group(1)
+    canonical = CANONICAL.search(text)
+    if not canonical:
+        return None
+    href = HREF_VALUE.search(canonical.group(0))
+    if href and href.group(1).strip():
+        return href.group(1).strip()
+    return None
+
+
+def looks_absolute(url: str) -> bool:
+    if url.startswith(("//", "mailto:", "javascript:", "data:", "urn:", "blob:")):
+        return True
+    return re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", url) is not None
+
+
+def existing_target(base: Path, url: str) -> Path | None:
+    raw = url.strip()
+    if not raw or raw.startswith("#") or looks_absolute(raw):
+        return None
+    fragmentless = raw.split("#", 1)[0]
+    candidates = [fragmentless]
+    if "?" in fragmentless:
+        candidates.append(fragmentless.split("?", 1)[0])
+    for candidate in candidates:
+        relative = unquote(candidate)
+        if not relative:
+            continue
+        path = (base / relative).resolve()
+        if path.exists():
+            return path
+    return None
+
+
+def urls_in(text: str) -> list[str]:
+    found = [match.group("url") for match in ATTR_URL.finditer(text)]
+    found.extend(match.group("url") for match in CSS_URL.finditer(text))
+    for match in SRCSET.finditer(text):
+        for part in match.group("val").split(","):
+            token = part.strip().split()
+            if token:
+                found.append(token[0])
+    return found
+
+
+def common_root(paths: list[Path]) -> Path:
+    root = Path(os.path.commonpath([str(path) for path in paths]))
+    return root.parent if root.is_file() else root
+
+
+def too_broad(root: Path, entry: Path) -> bool:
+    if root == Path("/"):
+        return True
+    home = Path.home().resolve()
+    return root == home and entry.parent.resolve() != home
+
+
+def files_under(root: Path, skip: Path | None) -> list[Path]:
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name != ".git"]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if skip is not None and path.resolve() == skip:
+                continue
+            files.append(path)
+    return files
+
+
+def linked_files(entry: Path, root: Path) -> list[Path]:
+    """Entry file, files reached by relative links, and a sibling _files folder."""
+    seen: set[Path] = set()
+    files: list[Path] = []
+    queue = [entry.resolve()]
+    while queue:
+        current = queue.pop()
+        if current in seen or not current.is_file():
+            continue
+        try:
+            current.relative_to(root)
+        except ValueError:
+            continue
+        seen.add(current)
+        files.append(current)
+        if current.suffix.lower() not in TEXT_SUFFIXES:
+            continue
+        text, _charset = read_text(current)
+        for url in urls_in(text):
+            target = existing_target(current.parent, url)
+            if target is None:
+                continue
+            if target.is_dir():
+                for child in files_under(target, None):
+                    queue.append(child.resolve())
+            else:
+                queue.append(target)
+    companion = entry.parent / f"{entry.stem}_files"
+    if companion.is_dir() and companion.resolve().is_relative_to(root):
+        for child in files_under(companion, None):
+            resolved = child.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                files.append(child)
+    return files
+
+
+def select_files(entry: Path) -> tuple[Path, list[Path]]:
+    entry = entry.resolve()
+    if not entry.is_file():
+        raise CreateError(f"Not a file: {entry}")
+    if entry.suffix.lower() not in INDEX_FOR_SUFFIX:
+        raise CreateError(f"{entry.name} is not an HTML page.")
+    text, _charset = read_text(entry)
+    anchors = [entry]
+    for url in urls_in(text):
+        target = existing_target(entry.parent, url)
+        if target is not None and target.is_file():
+            anchors.append(target.resolve())
+        elif target is not None and target.is_dir():
+            anchors.append(target.resolve())
+    root = common_root(anchors)
+    if too_broad(root, entry):
+        raise CreateError(
+            f"Links in {entry.name} reach outside its site directory. "
+            "Pass the site's index.html, or the HTML file from a Webpage, Complete save."
+        )
+    companion = entry.parent / f"{entry.stem}_files"
+    webpage_complete = companion.is_dir() and root == entry.parent
+    mirror = root != entry.parent or entry.name.lower() in INDEX_FOR_SUFFIX.values()
+    if webpage_complete or not mirror:
+        return root, linked_files(entry, root)
+    return root, files_under(root, None)
+
+
+def archive_name(relative: Path) -> str:
+    if len(relative.parts) == 1:
+        indexed = INDEX_FOR_SUFFIX.get(relative.suffix.lower())
+        if indexed is not None:
+            return indexed
+    return relative.as_posix()
+
+
+def split_suffix(url: str) -> tuple[str, str]:
+    path = url
+    suffix = ""
+    for marker in ("#", "?"):
+        if marker in path:
+            path, rest = path.split(marker, 1)
+            suffix = marker + rest + suffix
+    return path, suffix
+
+
+def rewrite_one(url: str, old: str, new: str) -> str:
+    path, suffix = split_suffix(url.strip())
+    decoded = unquote(path)
+    prefixed = decoded.startswith("./")
+    bare = decoded[2:] if prefixed else decoded
+    if bare != old:
+        return url
+    rewritten = f"./{new}" if prefixed else new
+    return rewritten + suffix
+
+
+def rewrite_text(text: str, old: str, new: str) -> str:
+    if not old or old == new:
+        return text
+
+    def attr(match: re.Match[str]) -> str:
+        return f"{match.group('prefix')}{match.group('q')}{rewrite_one(match.group('url'), old, new)}{match.group('q')}"
+
+    def css(match: re.Match[str]) -> str:
+        url = rewrite_one(match.group("url").strip(), old, new)
+        quote = match.group("q")
+        return f"{match.group('prefix')}{quote}{url}{quote}{match.group('suffix')}"
+
+    def srcset(match: re.Match[str]) -> str:
+        parts = []
+        for item in match.group("val").split(","):
+            tokens = item.strip().split()
+            if tokens:
+                tokens[0] = rewrite_one(tokens[0], old, new)
+                parts.append(" ".join(tokens))
+        return f"{match.group('prefix')}{match.group('q')}{', '.join(parts)}{match.group('q')}"
+
+    text = ATTR_URL.sub(attr, text)
+    text = CSS_URL.sub(css, text)
+    return SRCSET.sub(srcset, text)
+
+
+def neutralize_base(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        if match.group("url").strip() == "":
+            return match.group(0)
+        return f"{match.group('prefix')}{match.group('q')}{match.group('q')}"
+
+    return BASE_HREF.sub(replace, text, count=1)
+
+
+def relative_between(from_archive: str, to_archive: str) -> str:
+    start = Path(from_archive).parent
+    relative = Path(os.path.relpath(to_archive, start if str(start) != "." else "."))
+    return relative.as_posix()
+
+
+def file_bytes(
+    source: Path,
+    archive_rel: str,
+    old_entry: str,
+    new_entry: str,
+    is_entry: bool,
+) -> bytes:
+    raw = source.read_bytes()
+    rename = old_entry != new_entry
+    if source.suffix.lower() not in TEXT_SUFFIXES and not is_entry:
+        return raw
+    if not rename and not is_entry:
+        return raw
+    charset = detect_charset(raw)
+    try:
+        text = raw.decode(charset)
+    except (LookupError, UnicodeDecodeError):
+        text = raw.decode("utf-8", errors="replace")
+        charset = "utf-8"
+    if rename:
+        old_here = relative_between(archive_rel, old_entry)
+        new_here = relative_between(archive_rel, new_entry)
+        text = rewrite_text(text, old_here, new_here)
+    if is_entry:
+        text = neutralize_base(text)
+    updated = text.encode(charset, errors="replace")
+    return raw if updated == raw else updated
+
+
+def rdf_bytes(title: str, url: str | None, when: str, index_name: str, charset: str) -> bytes:
+    ET.register_namespace("RDF", RDF_NS)
+    ET.register_namespace("MAF", MAF_NS)
+    ET.register_namespace("NC", NC_NS)
+    root = ET.Element(f"{{{RDF_NS}}}RDF")
+    description = ET.SubElement(root, f"{{{RDF_NS}}}Description")
+    description.set(f"{{{RDF_NS}}}about", "urn:root")
+    fields = [("title", title), ("archivetime", when), ("indexfilename", index_name), ("charset", charset)]
+    if url:
+        fields.insert(0, ("originalurl", url))
+    for name, value in fields:
+        element = ET.SubElement(description, f"{{{MAF_NS}}}{name}")
+        element.set(f"{{{RDF_NS}}}resource", value)
+    body = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    return body if body.endswith(b"\n") else body + b"\n"
+
+
+def page_folder_name() -> str:
+    return f"{int(time.time() * 1000)}_{random.randint(0, 999)}"
+
+
+def compression_for(path: Path) -> int:
+    if path.suffix.lower() in STORED_SUFFIXES:
+        return zipfile.ZIP_STORED
+    return zipfile.ZIP_DEFLATED
+
+
+def zip_write(zf: zipfile.ZipFile, name: str, data: bytes, compress: int, mtime: float) -> None:
+    info = zipfile.ZipInfo(filename=name)
+    info.compress_type = compress
+    info.flag_bits |= 0x800
+    info.date_time = time.localtime(mtime)[:6]
+    info.external_attr = 0o644 << 16
+    zf.writestr(info, data)
+
+
+def build_page(entry: Path, output: Path) -> dict[str, str]:
+    root, sources = select_files(entry)
+    output_resolved = output.resolve()
+    sources = [path for path in sources if path.resolve() != output_resolved]
+    if not sources:
+        raise CreateError(f"No files to pack for {entry}.")
+    old_relative = entry.resolve().relative_to(root).as_posix()
+    new_relative = archive_name(Path(old_relative))
+    text, charset = read_text(entry)
+    title = html_title(text) or entry.stem
+    url = discovered_url(text)
+    when = email.utils.formatdate(entry.stat().st_mtime, localtime=True)
+    folder = page_folder_name()
+    return {
+        "root": str(root),
+        "folder": folder,
+        "title": title,
+        "url": url or "",
+        "when": when,
+        "index": new_relative,
+        "charset": charset,
+        "count": str(len(sources) + 1),
+        "_sources": sources,  # type: ignore[dict-item]
+        "_old": old_relative,
+        "_new": new_relative,
+    }
+
+
+def write_archive(pages: list[tuple[Path, dict]], output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(output, "w") as zf:
+        for entry, page in pages:
+            root = Path(page["root"])
+            folder = page["folder"]
+            old_relative = page["_old"]
+            new_relative = page["_new"]
+            for source in page["_sources"]:
+                relative = source.resolve().relative_to(root).as_posix()
+                stored_as = new_relative if relative == old_relative else relative
+                data = file_bytes(source, stored_as, old_relative, new_relative, relative == old_relative)
+                zip_write(
+                    zf,
+                    f"{folder}/{stored_as}",
+                    data,
+                    compression_for(source),
+                    source.stat().st_mtime,
+                )
+            metadata = rdf_bytes(
+                page["title"],
+                page["url"] or None,
+                page["when"],
+                new_relative,
+                page["charset"],
+            )
+            zip_write(zf, f"{folder}/index.rdf", metadata, zipfile.ZIP_DEFLATED, time.time())
+
+
+def default_output(entry: Path) -> Path:
+    root, _sources = select_files(entry)
+    companion = entry.parent / f"{entry.stem}_files"
+    if companion.is_dir() and root == entry.resolve().parent:
+        return entry.with_suffix(".maff")
+    return root.parent / f"{root.name}.maff"
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Pack a saved web page or a wget mirror into a MAFF archive.",
+    )
+    parser.add_argument("pages", nargs="+", type=Path, help="HTML file from a Webpage, Complete save or a wget -m -k mirror")
+    parser.add_argument("-o", "--output", type=Path, help="where to write the .maff file")
+    parser.add_argument("--url", help="original URL, stored in index.rdf")
+    parser.add_argument("--title", help="page title, stored in index.rdf")
+    parser.add_argument("--force", action="store_true", help="overwrite an existing archive")
+    args = parser.parse_args(argv)
+
+    if len(args.pages) > 1 and (args.url or args.title):
+        fail("Pass one page when using --url or --title.")
+    if args.output is None and len(args.pages) > 1:
+        fail("Give --output when packing more than one page into an archive.")
+    try:
+        output = (args.output or default_output(args.pages[0])).expanduser().resolve()
+    except CreateError as exc:
+        fail(str(exc))
+    if output.exists() and not args.force:
+        fail(f"{output} already exists. Pass --force to overwrite it.")
+    if output.suffix.lower() != ".maff":
+        output = output.with_suffix(output.suffix + ".maff")
+
+    built: list[tuple[Path, dict]] = []
+    try:
+        for path in args.pages:
+            page = build_page(path.expanduser(), output)
+            if args.url and len(args.pages) == 1:
+                page["url"] = args.url
+            if args.title and len(args.pages) == 1:
+                page["title"] = args.title
+            built.append((path, page))
+        write_archive(built, output)
+    except CreateError as exc:
+        fail(str(exc))
+
+    print(output)
+    for _path, page in built:
+        print(f"  {page['title']}")
+        if page["url"]:
+            print(f"  from  {page['url']}")
+        print(f"  saved {page['when']}")
+        print(f"  open  {page['index']}  ({page['count']} files)")
+
+
+if __name__ == "__main__":
+    main()
